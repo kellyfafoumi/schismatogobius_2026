@@ -1,0 +1,371 @@
+---
+title: "Analyse des otolithes"
+author: "Kelly Fafoumi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: '3'
+subtitle: "Analyse des migrations chez les Schismatogobius"
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  fig.align = "center"
+)
+
+# chargement des packages
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(ggplot2)
+library(RColorBrewer)
+library(knitr)
+library(kableExtra)
+library(MASS)
+library(dplyr)
+library(stringr)
+
+# configuration du répertoire de travail si nécessaire
+setwd("~/Library/CloudStorage/OneDrive-MNHN/EEVEF M2/STAGE/traitement des données/MEB")
+```
+
+# La configuration des chemins & les métadonnées
+
+On configure les accès aux données brutes de quantification MEB (quantis) et au fichier contenant les variables biologiques associées.
+
+```{r dossier}
+# dossier contenant les exports excel des quantifications 
+dossier_quantis <- "/Users/kellyfafoumi/Library/CloudStorage/OneDrive-MNHN/EEVEF M2/STAGE/traitement des données/MEB/données/Quantis"
+
+# fichier contenant les infos biologiques (ID, espèce, localité, etc.)
+fichier_infos <- "~/Documents/OneDrive - MNHN/EEVEF M2/STAGE/infos_otolithes.xlsx"
+```
+
+## La préparation des métadonnées
+
+Le tableau des métadonnées est importé et nettoyé afin de rendre les identifiants uniques comparables avec les fichiers dU MEB-EDS.
+
+```{r métadonnées}
+# charger et nettoyer les infos sur les otolithes
+infos_otolithes <- read_excel(fichier_infos)
+
+meta_ref <- infos_otolithes%>%
+  clean_names() %>% 
+  mutate(id_racine = as.character(id)%>% str_trim()) %>%
+  dplyr::select(id_racine, espece, provenance, localite = localite_precise, coordonnees, date) %>% 
+  distinct(id_racine, .keep_all = TRUE) 
+```
+
+## L'organisation des fichiers laser (quantis)
+
+On extrait automatiquement les identifiants des otolithes et les zones ciblées (cœur vs bord) à partir des structures des noms de fichiers.
+
+```{r}
+# liste tous les fichiers .xlsx dans le dossier contenant les quantifications 
+fichiers <- list.files(dossier_quantis, pattern = "\\.xlsx$", full.names = TRUE)
+
+df_fichiers <- tibble(chemin = fichiers)%>%
+  mutate(
+    nom_fichier = basename(chemin), 
+    id_otolithe = str_extract(nom_fichier, "^[^_\\s]+"), 
+    type = case_when( 
+      str_detect(nom_fichier, "core") ~ "core", 
+      str_detect(nom_fichier, "edge") ~ "edge",
+      TRUE ~ NA_character_
+    )
+  )%>%
+  filter(!is.na(type), !is.na(id_otolithe))%>%
+  dplyr::select(id_otolithe, type, chemin)%>% 
+  distinct(id_otolithe, type, .keep_all = TRUE)%>% 
+  pivot_wider(names_from = type, values_from = chemin)%>%
+  mutate(core = as.character(core), edge = as.character(edge))%>%
+  filter(!is.na(core), !is.na(edge))
+```
+
+# L'extraction, les ratios et la classification écologique
+
+## La fonction d'extraction EDS
+
+Cette fonction automatise l'extraction sélective de données directement depuis les fichiers bruts.
+Associée à une structure de boucle, elle isole les POURCENTAGES massiques et leurs erreurs.
+
+```{r}
+extraire_valeur_element <- function(chemin_excel, element, colonne) {
+  if (is.null(chemin_excel) || is.na(chemin_excel) || chemin_excel == "") return(NA_real_)
+  if (!file.exists(chemin_excel)) return(NA_real_)
+  data <- tryCatch(
+    read_excel(chemin_excel, col_names = FALSE, .name_repair = "minimal", progress = FALSE),
+    error = function(e) return(NULL)
+  )
+  if (is.null(data)) return(NA_real_)
+  ligne_idx <- which(data[[1]] == element)
+  if (length(ligne_idx) == 0) return(NA_real_)
+  val <- as.numeric(data[ligne_idx[1], colonne])
+  return(if(length(val) == 1) val else NA_real_)
+}
+```
+
+# La propagation de l'erreur et la classification écologique
+
+Ce bloc de code réalise l'automatisation du nettoyage des données, du calcul des rapports élémentaires, de la propagation des erreurs de mesure instrumentales et de la classification biologique des individus.
+
+Dans un premier temps, le script s'appuie sur la fonction `extraire_valeur_element()` pour parcourir les fichiers Excel bruts issus du logiciel analytique.
+Pour chaque otolithe, les pourcentages massiques de strontium ($Sr$) et de calcium ($Ca$), ainsi que leurs erreurs relatives associées (%), sont extraites séparément pour le cœur et le bord.
+Les ratios élémentaires finaux ($Sr/Ca$) s :$$SrCa_{\text{coeur}} = \frac{sr_{\text{coeur}}}{ca_{\text{coeur}}} \quad \text{et} \quad SrCa_{\text{bord}} = \frac{sr_{\text{bord}}}{ca_{\text{bord}}}$$
+
+Afin de ne pas surinterpréter les fluctuations mineures, la loi de propagation des erreurs de Gauss est intégrée au script.
+Cette étape permet de calculer l'incertitude absolue ($\sigma$) qui pèse sur la différence brute entre le bord et le cœur.
+
+Calcul des erreurs relatives combinées :$$err\_rel\_ratio = \sqrt{\left(\frac{rel\_err\_sr}{100}\right)^2 + \left(\frac{rel\_err\_ca}{100}\right)^2}$$Passage aux incertitudes absolues pour le cœur et le bord :$$err\_abs = SrCa \times err\_rel\_ratio$$Calcul de l'incertitude globale ($\sigma$) sur la différence ($Bord - Cœur$) :$$\sigma = \sqrt{(err\_coeur\_abs)^2 + (err\_bord\_abs)^2}$$Une variation chimique observée chez un poisson est déclarée statistiquement significative (significativite = TRUE) uniquement si l'amplitude de sa différence absolue dépasse le seuil critique de $2\sigma$ (ce qui équivaut à un intervalle de confiance d'environ 95%).$$\text{Significativité} : |SrCa_{\text{bord}} - SrCa_{\text{coeur}}| > 2\sigma$$
+
+Pour déterminer l'histoire de vie de chaque poisson, le script calcule un indice biologique d'évolution : le `ratio_evolution` ($\frac{SrCa_{\text{bord}}}{SrCa_{\text{coeur}}}$), arrondi à deux décimales.
+Une fonction conditionnelle (`case_when`) applique ensuite une clé de tri stricte mariant la significativité statistique et l'amplitude biologique des seuils (calibrés par les individus témoins) :
+
+- les résidents : les individus affichant un ratio stable et proche de 1 (0,80 ≤ ratio ≤ 1,20), indépendamment du résultat du test de significativité.
+  Ce catégorie matérialise l'absence de déplacement vers un milieu de salinité différente,
+
+- les migrateurs : ils présentent une transition environnementale franche validée statistiquement (p \< 0,05) et caractérisée par un effondrement du Sr au bord (ratio ≤ 0,62).
+  C'est la signature type d'un recrutement en eau douce,
+
+- les intermédiaires (variation faible) : ils présentent une diminution statistiquement significative mais d'amplitude modérée (0,62 \< ratio \< 0,80), traduisant une installation en milieu estuarien saumâtre ou en bas-cours d'eau.
+
+- les intermédiaires (migration inverse) : ils présentent une ugmentation significative du taux de Sr au bord (ratio \> 1,20), signant un déplacement vers un milieu à plus forte influence marine.
+
+- les intermédiaires (bruit machine) : ils présentent des fluctuations mathématiques hors-normes mais invalidées par le modèle d'erreur (≤ 2σ).
+
+Pour l'analyse de contingence et les représentations graphiques globales, les catégories sont condensées en deux statuts principaux : `Migrateur` et `Non-migrateur` (fusion des Résidents et des Variations faibles).
+Les profils inverses ou bruités sont isolés sous l'étiquette `À vérifier / Exclure` .
+
+```{r}
+resultats_stats <- df_fichiers %>%
+  rowwise() %>%
+  mutate(
+    # extraction des concentrations
+    sr_coeur = extraire_valeur_element(core, "Strontium", 5), 
+    ca_coeur = extraire_valeur_element(core, "Calcium", 5),
+    sr_bord  = extraire_valeur_element(edge, "Strontium", 5), 
+    ca_bord  = extraire_valeur_element(edge, "Calcium", 5),
+    
+    # extraction des erreurs de mesure
+    rel_err_sr_coeur = extraire_valeur_element(core, "Strontium", 8), 
+    rel_err_ca_coeur = extraire_valeur_element(core, "Calcium", 8),
+    rel_err_sr_bord  = extraire_valeur_element(edge, "Strontium", 8), 
+    rel_err_ca_bord  = extraire_valeur_element(edge, "Calcium", 8)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # calcul des ratios Sr/Ca
+    SrCa_coeur = sr_coeur / ca_coeur, 
+    SrCa_bord  = sr_bord / ca_bord,
+    
+    # équation de propagation des erreurs relatives 
+    err_rel_ratio_coeur = sqrt((rel_err_sr_coeur / 100)^2 + (rel_err_ca_coeur / 100)^2),
+    err_rel_ratio_bord  = sqrt((rel_err_sr_bord / 100)^2 + (rel_err_ca_bord / 100)^2),
+    err_coeur_abs       = SrCa_coeur * err_rel_ratio_coeur, 
+    err_bord_abs        = SrCa_bord  * err_rel_ratio_bord,
+    
+    # différence brute du ratio Sr/Ca entre le bord et le cœur
+    diff  = SrCa_bord - SrCa_coeur,
+    
+    # erreur globale sur cette différence
+    sigma = sqrt(err_coeur_abs^2 + err_bord_abs^2),
+    
+    # seuil critique de discernement (2 sigmas)
+    significativite = abs(diff) > (2 * sigma), 
+    ratio_brut      = SrCa_bord / SrCa_coeur,
+    ratio = round(ratio_brut, 2),
+    classification = case_when(
+      # scénario migrateur : jusqu'à l'individu témoin 05245G (0.62)
+      significativite & ratio <= 0.62 ~ "Migrateur",
+      
+      # scénario intermédiaire : strictement coincé entre les deux témoins
+      significativite & ratio > 0.62 & ratio < 0.69 ~ "Intermédiaire",
+      
+      # scénario non-migrateur: à partir du témoin RNTC106 (0.69) 
+      ratio >= 0.69 & ratio <= 1.20 ~ "Non-migrateur",
+      
+      # cas anormaux
+      TRUE ~ "À vérifier / Exclure"
+    )
+  )
+
+# classement des intermédiaires 
+
+# séparation des données
+donnees_temoins        <- resultats_stats %>% filter(classification %in% c("Migrateur", "Non-migrateur"))
+donnees_intermediaires <- resultats_stats %>% filter(classification == "Intermédiaire")
+donnees_exclues        <- resultats_stats %>% filter(classification == "À vérifier / Exclure")
+
+# entraînement de la LDA sur les individus témoins
+modele_lda <- lda(classification ~ SrCa_coeur + SrCa_bord + diff, data = donnees_temoins)
+# application et prédiction sur les profils intermédiaires
+predictions <- predict(modele_lda, newdata = donnees_intermediaires)
+# attribution du statut forcé et des probabilités pour les intermédiaires
+donnees_intermediaires <- donnees_intermediaires %>%
+  mutate(statut = as.character(predictions$class), probabilite_affectation = apply(predictions$posterior, 1, max))
+
+# pour les témoins, le statut  est identique à leur classification d'origine
+donnees_temoins <- donnees_temoins %>% 
+  mutate(statut = classification, 
+    probabilite_affectation = 1.00)
+
+# traitement propre des lignes exclues
+if(nrow(donnees_exclues) > 0) {
+  donnees_exclues <- donnees_exclues %>% 
+    mutate(statut = "Exclu", probabilite_affectation = NA)
+}
+
+# reconstruction du tableau complet
+resultats_stats <- bind_rows(donnees_temoins, donnees_intermediaires, donnees_exclues)
+View(resultats_stats)
+```
+
+
+# La fusion des métadonnées
+
+On fusionne l'ensemble des descripteurs biologiques associés à chaque poisson.
+
+```{r}
+resultats_complets <- resultats_stats%>% 
+  rowwise()%>%
+  mutate(
+    match_pos = which(str_detect(id_otolithe, fixed(meta_ref$id_racine)))[1],
+    espece_brut     = if(!is.na(match_pos)) meta_ref$espece[match_pos] else "Inconnue",
+    provenance_brut = if(!is.na(match_pos)) meta_ref$provenance[match_pos] else "Inconnue",
+    localite_brut   = if(!is.na(match_pos)) meta_ref$localite[match_pos] else "Inconnue",
+    coordonnees_brut   = if(!is.na(match_pos)) meta_ref$coordonnees[match_pos] else "Inconnue",
+    date_brut       = if(!is.na(match_pos)) meta_ref$date[match_pos] else "Inconnue"
+  )%>%
+  ungroup()%>% filter(statut != "À vérifier / Exclure")%>%
+  mutate(
+    espece = case_when(is.na(espece_brut) | espece_brut == "" | espece_brut == "NA" ~ "Inconnue", TRUE ~ as.character(espece_brut)),
+    provenance = case_when(is.na(provenance_brut) | provenance_brut == "" | provenance_brut == "NA" ~ "Inconnue", TRUE ~ as.character(provenance_brut)),
+    localite = case_when(is.na(localite_brut) | localite_brut == "" | localite_brut == "NA" ~ "Inconnue", TRUE ~ as.character(localite_brut)),
+    coordonnees = case_when(is.na(coordonnees_brut) | coordonnees_brut == "" | coordonnees_brut == "NA" ~ "Inconnue", TRUE ~ as.character(coordonnees_brut)),
+    date = case_when(is.na(date_brut) | date_brut == "" | date_brut == "NA" ~ "Inconnue", TRUE ~ as.character(date_brut))
+  )%>%
+  dplyr::select(-match_pos, -ends_with("_brut"))
+
+View(resultats_complets)
+```
+
+# L'évalution de la méthodologie
+
+Afin de valider que les changements d'environnement observés ne découlent pas d'une erreur de quantification, ce test de Student apparié unilatéral compare l'amplitude du saut biologique ( $\Delta = |Bord - Coeur|$) face au seuil maximal d'incertitude ($2\sigma$, représentant l'intervalle de confiance à 95%).
+
+```{r}
+# calcul du ratio signal/incertitude par individu
+df_validation <- resultats_complets %>%
+  mutate(saut_signal = abs(diff),
+         seuil_bruit  = 2 * sigma)
+
+# test t pour valider que le saut biologique dépasse largement le bruit machine
+test_robustesse <- t.test(df_validation$saut_signal, df_validation$seuil_bruit, 
+                          paired = TRUE, alternative = "greater")
+print(test_robustesse)
+```
+
+# Aperçus des données et profils
+
+#### Tableau croisé : espèce × classification migratoire
+
+```{r}
+table_statuts <- resultats_complets%>% count(espece, statut)%>%
+  group_by(espece)%>% mutate(pourcentage = (n / sum(n)) * 100)
+
+print(table_statuts) 
+```
+
+# Les tests statistiques pour répondre aux questions de recherche
+
+On isole l'analyse comparative sur les deux principaux taxons d'intérêt : *Schismatogobius fuligimentus* et *Schismatogobius vanuatuensis*.
+
+```{r}
+# isoler les taxons cibles
+df_filtre <- resultats_complets%>% mutate(espece = str_trim(espece))%>%  filter(espece%in% c("Schismatogobius fuligimentus", "Schismatogobius vanuatuensis"))%>% mutate(statut = factor(statut, levels = c("Migrateur", "Non-migrateur")))
+```
+
+## Le test d'indépendance de contingence (Fisher)
+
+On teste la dépendance statistique entre les deux taxons et leurs profils de vie (variables catégorielles).
+
+```{r}
+table_espece <- table(df_filtre$espece, df_filtre$statut)
+print(table_espece)
+
+test_fisher <- fisher.test(table_espece, simulate.p.value = TRUE)
+print(test_fisher)
+```
+
+## Les tests de comparaison inter-espèces (Wilcoxon-Mann-Whitney)
+
+Au-delà de la classification nominale par seuil, nous comparons les distributions quantitatives absolues des ratios au cœur (milieu du stade larvaire) et au bord (milieu du stade adulte) entre les espèces.
+
+```{r}
+
+statistiques_coeur_bord <- df_filtre %>%
+  group_by(espece) %>%
+  summarise(
+    moyenne_coeur = mean(SrCa_coeur, na.rm = TRUE),
+    sd_coeur = sd(SrCa_coeur, na.rm = TRUE),
+    N_coeur = n(),
+    moyenne_bord = mean(SrCa_bord, na.rm = TRUE),
+    sd_bord = sd(SrCa_bord, na.rm = TRUE),
+    N_bord = n()
+  )
+
+print(statistiques_coeur_bord)
+```
+
+```{r}
+# différence de milieu à la naissance (coeur) entre les deux espèces
+wilcox.test(SrCa_coeur ~ espece, data = df_filtre)
+# différence de milieu à la capture (bord) entre les deux espèces
+wilcox.test(SrCa_bord ~ espece, data = df_filtre)
+```
+
+## Les tests d'évolution intra-individuelle (Wilcoxon appariés)
+
+```{r}
+df_vanua <- df_filtre%>% filter(espece == "Schismatogobius vanuatuensis")
+wilcox.test(df_vanua$SrCa_coeur, df_vanua$SrCa_bord, paired = TRUE, alternative = "greater")
+```
+
+```{r}
+df_fuligi <- df_filtre%>% filter(espece == "Schismatogobius fuligimentus")
+wilcox.test(df_fuligi$SrCa_coeur, df_fuligi$SrCa_bord, paired = TRUE, alternative = "greater")
+```
+
+## L'analyse de l'amplitude de ($\Delta$)
+
+On teste si l'amplitude brute du changement d'environnement ($\Delta = Bord - Coeur$) varie significativement d'une espèce à l'autre.
+
+```{r}
+test_delta <- wilcox.test(diff ~ espece, data = df_filtre)
+print(test_delta)
+
+# calculer les moyennes (et écarts-types) de diff par espèce
+statistiques_delta <- df_filtre %>%
+  group_by(espece) %>%
+  summarise(moyenne = mean(diff, na.rm = TRUE), ecart_type = sd(diff, na.rm = TRUE),  effectif = n()                     
+  )
+
+print(statistiques_delta)
+```
